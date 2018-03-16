@@ -1,3 +1,5 @@
+# TODO: save less checkpoints (make it adjustable)
+#
 # Copyright 2017 Google Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -150,6 +152,7 @@ flags.DEFINE_integer('summary_every_steps', 60,
                      'How often to save summaries (in STEPS).')
 flags.DEFINE_integer('scaling_rule',0,'0: do not scale; 1: linear scaling; 2: sqrt scaling')
 flags.DEFINE_integer('save_model_secs',300,'how often to save model checkpoints (0 for never)')
+flags.DEFINE_integer('max_to_keep', 1, 'maximum number of checkpoints to keep')
 flags.DEFINE_integer('do_benchmark_test',0,'set to 1 for benchmark tests')
 flags.DEFINE_string('timelog','timelog','logfile for benchmark timing containing nranks, nthreads, time/step')
 flags.DEFINE_integer('warmup_steps',0,'number of warmup steps')
@@ -162,6 +165,7 @@ flags.DEFINE_integer('num_intra_threads', 0,
 flags.DEFINE_integer('num_inter_threads', 0,
                      'Number of threads to use for inter-op parallelism. If '
                      'set to 0, the system will pick an appropriate number.')
+
 
 FLAGS = flags.FLAGS
 
@@ -309,6 +313,9 @@ class EvalTracker(object):
 
     accuracy    = (self.tp + self.tn) / (self.tp + self.tn + self.fp + self.fn)
     precision   = self.tp / (self.tp + self.fp)
+    #if hvd.rank()==0:
+    #  print("tp, fp, tn, fn, acc, prec:")
+    #  print(self.tp, self.fp, self.tn, self.fn, accuracy, precision)
     recall      = self.tp / (self.tp + self.fn)
     #specificity = self.tn / (self.tn + self.fp) #leave out specificity, bc/ it can become singular
     f1 = (2.0 * precision * recall) / (precision + recall)
@@ -319,6 +326,12 @@ class EvalTracker(object):
           summary.tag += '/%d' % i
     return self.images_xy, self.images_xz, self.images_yz, self.loss/self.num_patches, self.num_patches, accuracy, precision, recall, f1
 
+  def get_summaries_mod2(self):
+    # tage the images
+    for images in self.images_xy, self.images_xz, self.images_yz:
+      for i, summary in enumerate(images):
+        summary.tag += '/%d' % i
+    return self.tp, self.fp, self.tn, self.fn, self.num_patches, self.images_xy, self.images_xz, self.images_yz
 
 
 def run_training_step(sess, model, fetch_summary, feed_dict):
@@ -473,6 +486,8 @@ def define_data_input(model, queue_batch=None):
       min_after_dequeue=4 * FLAGS.batch_size,
       enqueue_many=True)
 
+  #print("patches shape:", np.shape(patches))
+  #print("labels shape:", np.shape(labels))
   return patches, labels, loss_weights, coord, volname
 
 
@@ -662,16 +677,16 @@ def train_ffn(model_cls, **model_kwargs):
 
     var_to_reduce = tf.placeholder(tf.float32)
     bcast_op = hvd.broadcast_global_variables(0)
-    avg_op = hvd.allreduce(var_to_reduce)
+    avg_op = hvd.allreduce(var_to_reduce, average=True)
 
     # Start supervisor.
     sv = tf.train.Supervisor(
         logdir = (FLAGS.train_dir if hvd.rank()==0 else None),
         is_chief = True,
-        saver = (model.saver if hvd.rank()==0 else None),
+        saver = (tf.train.Saver(max_to_keep=FLAGS.max_to_keep) if hvd.rank()==0 else None),
+        save_model_secs = (FLAGS.save_model_secs if hvd.rank()==0 else 0),
         summary_op = None,
-        save_summaries_secs = 0,
-        save_model_secs = (FLAGS.save_model_secs if hvd.rank()==0 else 0)
+        save_summaries_secs = 0, # will perform custom summaries instead
         )
 
     sess = sv.prepare_or_wait_for_session(
@@ -767,26 +782,38 @@ def train_ffn(model_cls, **model_kwargs):
         # single-step field of view of the network). This quantifies the
         # quality of the final object mask.
 
-        im_xy, im_xz, im_yz, patch_loss, num_patches, accuracy, precision, recall, f1 = eval_tracker.get_summaries_mod()
+        #im_xy, im_xz, im_yz, patch_loss, num_patches, accuracy, precision, recall, f1 = eval_tracker.get_summaries_mod()
+        tp, fp, tn, fn, num_patches, im_xy, im_xz, im_yz = eval_tracker.get_summaries_mod2()
         eval_tracker.reset()        
         # average metrics
-        avg_accuracy = sess.run(avg_op, feed_dict={var_to_reduce:accuracy})
-        avg_precision = sess.run(avg_op, feed_dict={var_to_reduce:precision})
-        avg_recall = sess.run(avg_op, feed_dict={var_to_reduce:recall})
+        #avg_accuracy = sess.run(avg_op, feed_dict={var_to_reduce:accuracy})
+        #avg_precision = sess.run(avg_op, feed_dict={var_to_reduce:precision})
+        #avg_recall = sess.run(avg_op, feed_dict={var_to_reduce:recall})
         #avg_specificity = sess.run(avg_op, feed_dict={var_to_reduce:specificity})
-        avg_f1 = sess.run(avg_op, feed_dict={var_to_reduce:f1})
-        avg_num_patches   = sess.run(avg_op, feed_dict={var_to_reduce:num_patches}) 
-        avg_patch_loss    = sess.run(avg_op, feed_dict={var_to_reduce:patch_loss})
+        #avg_f1 = sess.run(avg_op, feed_dict={var_to_reduce:f1})
+        #avg_num_patches   = sess.run(avg_op, feed_dict={var_to_reduce:num_patches}) 
+        #avg_patch_loss    = sess.run(avg_op, feed_dict={var_to_reduce:patch_loss})
+
+        tp_sum = hvd.size() * sess.run(avg_op, feed_dict={var_to_reduce:float(tp)})
+        fp_sum = hvd.size() * sess.run(avg_op, feed_dict={var_to_reduce:float(fp)})
+        tn_sum = hvd.size() * sess.run(avg_op, feed_dict={var_to_reduce:float(tn)})
+        fn_sum = hvd.size() * sess.run(avg_op, feed_dict={var_to_reduce:float(fn)})
+        avg_num_patches = sess.run(avg_op, feed_dict={var_to_reduce:float(num_patches)})
+
+        accuracy = (tp_sum+tn_sum)/(tp_sum+fp_sum+tn_sum+fn_sum)
+        precision = (tp_sum)/(tp_sum+fp_sum)
+        recall = (tp_sum)/(tp_sum+fn_sum)
+        f1 = 2.0*precision*recall/(precision+recall)
 
         eval_tracker_summaries = (
             list(im_xy) + list(im_xz) + list(im_yz) + [
-                tf.Summary.Value(tag='eval/patch_loss', simple_value=avg_patch_loss),
+                #tf.Summary.Value(tag='eval/patch_loss', simple_value=avg_patch_loss),
                 tf.Summary.Value(tag='eval/patches', simple_value=avg_num_patches),
-                tf.Summary.Value(tag='eval/accuracy', simple_value=avg_accuracy),
-                tf.Summary.Value(tag='eval/precision', simple_value=avg_precision),
-                tf.Summary.Value(tag='eval/recall', simple_value=avg_recall),
+                tf.Summary.Value(tag='eval/accuracy', simple_value=accuracy),
+                tf.Summary.Value(tag='eval/precision', simple_value=precision),
+                tf.Summary.Value(tag='eval/recall', simple_value=recall),
                 #tf.Summary.Value(tag='eval/specificity', simple_value=avg_specificity),
-                tf.Summary.Value(tag='eval/f1', simple_value=avg_f1)
+                tf.Summary.Value(tag='eval/f1', simple_value=f1)
             ])
 
         if hvd.rank()==0:
@@ -830,7 +857,8 @@ def main(argv=()):
   # Multiply the task number by a value large enough that tasks starting at a
   # similar time cannot end up with the same seed.
   seed = int(time.time() + hvd.rank() * 3600 * 24)
-  logging.info('Random seed: %r', seed)
+  if hvd.rank()==0:
+    logging.info('Random seed: %r', seed)
   random.seed(seed)
   if hvd.rank()==0:
     print("train dir:", FLAGS.train_dir)

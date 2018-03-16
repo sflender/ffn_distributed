@@ -76,7 +76,7 @@ def decorated_volume(settings, **kwargs):
 
 # TODO(mjanusz): Consider switching to pyglib.atomic_file.
 @contextmanager
-def atomic_file(path):
+def atomic_file(path, mode='w+b'):
   """Atomically saves data to a target path.
 
   Any existing data at the target path will be overwritten.
@@ -87,7 +87,7 @@ def atomic_file(path):
   Yields:
     file-like object
   """
-  with tempfile.NamedTemporaryFile() as tmp:
+  with tempfile.NamedTemporaryFile(mode=mode) as tmp:
     yield tmp
     tmp.flush()
     # Necessary when the destination is on CNS.
