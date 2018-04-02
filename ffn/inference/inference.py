@@ -544,18 +544,19 @@ class Canvas(object):
         if not (self.is_valid_pos(pos, ignore_move_threshold=True)
                 and self.restrictor.is_valid_pos(pos)):
           continue
-
+        logging.info('---1---')
         self._maybe_save_checkpoint()
-
+        logging.info('---2---')
         # Too close to an existing segment?
         low = np.array(pos) - mbd
         high = np.array(pos) + mbd + 1
         sel = [slice(s, e) for s, e in zip(low, high)]
+        logging.info('---3---')
         if np.any(self.segmentation[sel] > 0):
           logging.debug('Too close to existing segment.')
           self.segmentation[pos] = -1
           continue
-
+        logging.info('---4---')
         logging.info('Starting segmentation at %r (zyx)', pos)
 
         # Try segmentation.
@@ -622,8 +623,9 @@ class Canvas(object):
 
         # Record information about how a given supervoxel was created.
         self.origins[self._max_id] = storage.OriginInfo(pos, num_iters, t_seg)
+        logging.info('---5---')
         self.counters['valid-time-ms'].IncrementBy(t_seg * MSEC_IN_SEC)
-
+        logging.info('---6---')
   def init_segmentation_from_volstore(self, volstore, corner, end,
                                       align_and_crop=None,
                                       relabel_init_ids=True):

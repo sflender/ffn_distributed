@@ -307,31 +307,19 @@ class EvalTracker(object):
 
     return summaries
 
+  def get_summaries_scalar(self):
+    # only get scalar summaries
+    # as individual values, so that we can later reduce them
+    return self.tp, self.fp, self.tn, self.fn, self.num_patches
 
-  def get_summaries_mod(self):
-    #--my modifification of get summaries; this will not yet produce tf.Summary.Value. Instead do this after allreduce. 
-
-    accuracy    = (self.tp + self.tn) / (self.tp + self.tn + self.fp + self.fn)
-    precision   = self.tp / (self.tp + self.fp)
-    #if hvd.rank()==0:
-    #  print("tp, fp, tn, fn, acc, prec:")
-    #  print(self.tp, self.fp, self.tn, self.fn, accuracy, precision)
-    recall      = self.tp / (self.tp + self.fn)
-    #specificity = self.tn / (self.tn + self.fp) #leave out specificity, bc/ it can become singular
-    f1 = (2.0 * precision * recall) / (precision + recall)
-
-    if hvd.rank()==0: #write summaries only on rank 0.
-      for images in self.images_xy, self.images_xz, self.images_yz:
-        for i, summary in enumerate(images):
-          summary.tag += '/%d' % i
-    return self.images_xy, self.images_xz, self.images_yz, self.loss/self.num_patches, self.num_patches, accuracy, precision, recall, f1
-
-  def get_summaries_mod2(self):
-    # tage the images
+  def get_summaries_images(self):
+    # get image summaries
     for images in self.images_xy, self.images_xz, self.images_yz:
       for i, summary in enumerate(images):
         summary.tag += '/%d' % i
-    return self.tp, self.fp, self.tn, self.fn, self.num_patches, self.images_xy, self.images_xz, self.images_yz
+    summaries_images = ( list(self.images_xy) + list(self.images_xz) + list(self.images_yz) )
+    return summaries_images
+
 
 
 def run_training_step(sess, model, fetch_summary, feed_dict):
@@ -683,7 +671,7 @@ def train_ffn(model_cls, **model_kwargs):
     sv = tf.train.Supervisor(
         logdir = (FLAGS.train_dir if hvd.rank()==0 else None),
         is_chief = True,
-        saver = (tf.train.Saver(max_to_keep=FLAGS.max_to_keep) if hvd.rank()==0 else None),
+        saver = (tf.train.Saver(max_to_keep=FLAGS.max_to_keep, keep_checkpoint_every_n_hours=1) if hvd.rank()==0 else None),
         save_model_secs = (FLAGS.save_model_secs if hvd.rank()==0 else 0),
         summary_op = None,
         save_summaries_secs = 0, # will perform custom summaries instead
@@ -729,7 +717,7 @@ def train_ffn(model_cls, **model_kwargs):
 
       if steps_since_last_summary==FLAGS.summary_every_steps:
         summ_op = merge_summaries_op
-        steps_since_last_summary=0
+        steps_since_last_summary=1
         if hvd.rank()==0:
           print("step ", step, "is a summary step")
       else:
@@ -782,17 +770,7 @@ def train_ffn(model_cls, **model_kwargs):
         # single-step field of view of the network). This quantifies the
         # quality of the final object mask.
 
-        #im_xy, im_xz, im_yz, patch_loss, num_patches, accuracy, precision, recall, f1 = eval_tracker.get_summaries_mod()
-        tp, fp, tn, fn, num_patches, im_xy, im_xz, im_yz = eval_tracker.get_summaries_mod2()
-        eval_tracker.reset()        
-        # average metrics
-        #avg_accuracy = sess.run(avg_op, feed_dict={var_to_reduce:accuracy})
-        #avg_precision = sess.run(avg_op, feed_dict={var_to_reduce:precision})
-        #avg_recall = sess.run(avg_op, feed_dict={var_to_reduce:recall})
-        #avg_specificity = sess.run(avg_op, feed_dict={var_to_reduce:specificity})
-        #avg_f1 = sess.run(avg_op, feed_dict={var_to_reduce:f1})
-        #avg_num_patches   = sess.run(avg_op, feed_dict={var_to_reduce:num_patches}) 
-        #avg_patch_loss    = sess.run(avg_op, feed_dict={var_to_reduce:patch_loss})
+        tp, fp, tn, fn, num_patches = eval_tracker.get_summaries_scalar()
 
         tp_sum = hvd.size() * sess.run(avg_op, feed_dict={var_to_reduce:float(tp)})
         fp_sum = hvd.size() * sess.run(avg_op, feed_dict={var_to_reduce:float(fp)})
@@ -805,23 +783,21 @@ def train_ffn(model_cls, **model_kwargs):
         recall = (tp_sum)/(tp_sum+fn_sum)
         f1 = 2.0*precision*recall/(precision+recall)
 
-        eval_tracker_summaries = (
-            list(im_xy) + list(im_xz) + list(im_yz) + [
-                #tf.Summary.Value(tag='eval/patch_loss', simple_value=avg_patch_loss),
+        eval_tracker_summaries = ([
                 tf.Summary.Value(tag='eval/patches', simple_value=avg_num_patches),
                 tf.Summary.Value(tag='eval/accuracy', simple_value=accuracy),
                 tf.Summary.Value(tag='eval/precision', simple_value=precision),
                 tf.Summary.Value(tag='eval/recall', simple_value=recall),
-                #tf.Summary.Value(tag='eval/specificity', simple_value=avg_specificity),
                 tf.Summary.Value(tag='eval/f1', simple_value=f1)
             ])
 
         if hvd.rank()==0:
           logging.info('Saving summaries.')
           summ = tf.Summary() #initialize tensorflow summary
-          summ.value.extend(eval_tracker_summaries) #write EFOV metrics into summary
+          summ.value.extend(eval_tracker_summaries) # add EFOV metrics
+          summ.value.extend(eval_tracker.get_summaries_images()) # add image summaries
           for s in summaries:
-            summ.value.extend(s.value) #write FOV metrics into summary
+            summ.value.extend(s.value) # add FOV metrics
           # other custom summary items:
           summ.value.extend( [tf.Summary.Value(tag='avg_pixel_loss',simple_value=avg_loss ) ] ) #avg pixel loss 
           summ.value.extend( [tf.Summary.Value(tag='learning_rate',simple_value=scaled_lr ) ] )  #(scaled) learning rate
@@ -830,6 +806,9 @@ def train_ffn(model_cls, **model_kwargs):
           print("avg throughput: ", FLAGS.batch_size/np.mean(timing) )
           timing = [] # reset the timing array
           sv.summary_computed(sess, summ, step)
+
+        # reset eval tracker before the next training step.
+        eval_tracker.reset()
 
     if hvd.rank()==0:
       print("all steps done!")
