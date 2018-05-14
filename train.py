@@ -684,6 +684,8 @@ def train_ffn(model_cls, **model_kwargs):
                 intra_op_parallelism_threads = FLAGS.num_intra_threads,
                 inter_op_parallelism_threads = FLAGS.num_inter_threads))
 
+    # broadcast initial weights. This ensures that all horovod ranks 
+    # start at the same point in parameter space
     if hvd.rank()==0:
       print("broadcasting initial weights")
     sess.run(bcast_op)
